@@ -1,0 +1,1205 @@
+diff --git a/kernel/constids.inc b/kernel/constids.inc
+index 566b76217..1ea13022c 100644
+--- a/kernel/constids.inc
++++ b/kernel/constids.inc
+@@ -88,6 +88,10 @@ X(force_downto)
+ X(force_upto)
+ X(fsm_encoding)
+ X(fsm_export)
++X(FSM_PROTECT)
++X(FSM_PROTECT_HD)
++X(FSM_PROTECT_K)
++X(FSM_PROTECT_MOD_SIZE)
+ X(FULL)
+ X(full_case)
+ X(G)
+@@ -123,6 +127,7 @@ X(maximize)
+ X(mem2reg)
+ X(MEMID)
+ X(minimize)
++X(MOD_TABLE)
+ X(module_not_derived)
+ X(N)
+ X(NAME)
+diff --git a/kernel/rtlil.cc b/kernel/rtlil.cc
+index a89edd992..3424a063d 100644
+--- a/kernel/rtlil.cc
++++ b/kernel/rtlil.cc
+@@ -286,6 +286,18 @@ int RTLIL::Const::as_int(bool is_signed) const
+ 	return ret;
+ }
+ 
++uint64_t RTLIL::Const::as_uint64(bool is_signed) const
++{
++	uint64_t ret = 0;
++	for (size_t i = 0; i < bits.size() && i < 64; i++)
++		if (bits[i] == State::S1)
++			ret |= 1 << i;
++	if (is_signed && bits.back() == State::S1)
++		for (size_t i = bits.size(); i < 64; i++)
++			ret |= 1 << i;
++	return ret;
++}
++
+ std::string RTLIL::Const::as_string() const
+ {
+ 	std::string ret;
+@@ -318,6 +330,33 @@ RTLIL::Const RTLIL::Const::from_string(const std::string &str)
+ 	return c;
+ }
+ 
++unsigned int RTLIL::Const::as_bin() const
++{
++	unsigned int res = 0;
++	unsigned int in_pos = 0;
++	for(int i = 0; i < GetSize(bits); i++)
++	{
++		if(bits[i] == RTLIL::State::S0)
++			res |= 0 << in_pos++;
++		else if(bits[i] == RTLIL::State::S1)
++			res |= 1 << in_pos++;
++	}
++	return res;
++}
++
++unsigned int RTLIL::Const::get_bin_size() const
++{
++	unsigned int size = 0;
++	for(int i = 0; i < GetSize(bits); i++)
++	{
++		if(bits[i] == RTLIL::State::S0)
++			size++;
++		else if(bits[i] == RTLIL::State::S1)
++			size++;
++	}
++	return size;
++}
++
+ std::string RTLIL::Const::decode_string() const
+ {
+ 	std::string string;
+@@ -1465,6 +1504,10 @@ namespace {
+ 				param(ID::NAME);
+ 				param_bool(ID::CLK_POLARITY);
+ 				param_bool(ID::ARST_POLARITY);
++				param(ID::FSM_PROTECT);
++				param(ID::FSM_PROTECT_K);
++				param(ID::FSM_PROTECT_MOD_SIZE);
++				param(ID::FSM_PROTECT_HD);
+ 				param(ID::STATE_BITS);
+ 				param(ID::STATE_NUM);
+ 				param(ID::STATE_NUM_LOG2);
+@@ -1472,6 +1515,7 @@ namespace {
+ 				param_bits(ID::STATE_TABLE, param(ID::STATE_BITS) * param(ID::STATE_NUM));
+ 				param(ID::TRANS_NUM);
+ 				param_bits(ID::TRANS_TABLE, param(ID::TRANS_NUM) * (2*param(ID::STATE_NUM_LOG2) + param(ID::CTRL_IN_WIDTH) + param(ID::CTRL_OUT_WIDTH)));
++				param_bits(ID::MOD_TABLE, param(ID::TRANS_NUM) * (32+64));
+ 				port(ID::CLK, 1);
+ 				port(ID::ARST, 1);
+ 				port(ID::CTRL_IN, param(ID::CTRL_IN_WIDTH));
+@@ -4576,7 +4620,7 @@ bool RTLIL::SigSpec::as_bool() const
+ int RTLIL::SigSpec::as_int(bool is_signed) const
+ {
+ 	cover("kernel.rtlil.sigspec.as_int");
+-
++    log("IN as_int\n");
+ 	pack();
+ 	log_assert(is_fully_const() && GetSize(chunks_) <= 1);
+ 	if (width_)
+diff --git a/kernel/rtlil.h b/kernel/rtlil.h
+index d8300f159..efd309460 100644
+--- a/kernel/rtlil.h
++++ b/kernel/rtlil.h
+@@ -650,11 +650,15 @@ struct RTLIL::Const
+ 
+ 	bool as_bool() const;
+ 	int as_int(bool is_signed = false) const;
++	uint64_t as_uint64(bool is_signed = false) const;
+ 	std::string as_string() const;
+ 	static Const from_string(const std::string &str);
+ 
+ 	std::string decode_string() const;
+ 
++	unsigned int as_bin() const;
++	unsigned int get_bin_size() const;
++
+ 	inline int size() const { return bits.size(); }
+ 	inline bool empty() const { return bits.empty(); }
+ 	inline RTLIL::State &operator[](int index) { return bits.at(index); }
+diff --git a/passes/fsm/Makefile.inc b/passes/fsm/Makefile.inc
+index 38623e49e..98fbd5c6f 100644
+--- a/passes/fsm/Makefile.inc
++++ b/passes/fsm/Makefile.inc
+@@ -8,4 +8,5 @@ OBJS += passes/fsm/fsm_recode.o
+ OBJS += passes/fsm/fsm_info.o
+ OBJS += passes/fsm/fsm_export.o
+ OBJS += passes/fsm/fsm_map.o
++OBJS += passes/fsm/fsm_protect.o
+ 
+diff --git a/passes/fsm/fsm.cc b/passes/fsm/fsm.cc
+index 0c5e624dc..e3458e57d 100644
+--- a/passes/fsm/fsm.cc
++++ b/passes/fsm/fsm.cc
+@@ -76,6 +76,7 @@ struct FsmPass : public Pass {
+ 		bool flag_expand = false;
+ 		bool flag_fullexpand = false;
+ 		bool flag_export = false;
++		bool flag_protect = false;
+ 		std::string fm_set_fsm_file_opt;
+ 		std::string encfile_opt;
+ 		std::string encoding_opt;
+@@ -122,6 +123,10 @@ struct FsmPass : public Pass {
+ 				flag_export = true;
+ 				continue;
+ 			}
++			if (arg == "-protect") {
++				flag_protect = true;
++				continue;
++			}
+ 			break;
+ 		}
+ 		extra_args(args, argidx, design);
+@@ -146,6 +151,9 @@ struct FsmPass : public Pass {
+ 
+ 		if (flag_export)
+ 			Pass::call(design, "fsm_export");
++		
++		if (flag_protect)
++			Pass::call(design, "fsm_protect");
+ 
+ 		if (!flag_nomap)
+ 			Pass::call(design, "fsm_map");
+diff --git a/passes/fsm/fsm_extract.cc b/passes/fsm/fsm_extract.cc
+index 62a9d309e..dd86b6c0b 100644
+--- a/passes/fsm/fsm_extract.cc
++++ b/passes/fsm/fsm_extract.cc
+@@ -160,6 +160,9 @@ undef_bit_in_next_state:
+ 		log_assert(ctrl_out.is_fully_const() && dff_in.is_fully_const());
+ 
+ 		FsmData::transition_t tr;
++		FsmData::modifier_t md;
++		md.mod_size = 0;
++		md.mod = 0;
+ 		tr.ctrl_in = sig2const(ce, ctrl_in, RTLIL::State::Sa, dont_care);
+ 		tr.ctrl_out = sig2const(ce, ctrl_out, RTLIL::State::Sx);
+ 
+@@ -190,6 +193,7 @@ undef_bit_in_next_state:
+ 
+ 		if (dff_in.is_fully_def()) {
+ 			fsm_data.transition_table.push_back(tr);
++			fsm_data.modifier_table.push_back(md);
+ 			log("  transition: %10s %s -> %10s %s\n",
+ 					log_signal(log_state_in), log_signal(tr.ctrl_in),
+ 					log_signal(fsm_data.state_table[tr.state_out]), log_signal(tr.ctrl_out));
+@@ -346,6 +350,10 @@ static void extract_fsm(RTLIL::Wire *wire)
+ 	fsm_data.num_inputs = ctrl_in.size();
+ 	fsm_data.num_outputs = ctrl_out.size();
+ 	fsm_data.state_bits = wire->width;
++	fsm_data.fsm_protect = false;
++	fsm_data.fsm_protect_k = 1;
++	fsm_data.fsm_protect_mod_size = 0;
++	fsm_data.fsm_protect_hd = 2;
+ 	fsm_data.reset_state = -1;
+ 	for (auto &it : states) {
+ 		it.second = fsm_data.state_table.size();
+diff --git a/passes/fsm/fsm_map.cc b/passes/fsm/fsm_map.cc
+index df31dbb7a..49076857a 100644
+--- a/passes/fsm/fsm_map.cc
++++ b/passes/fsm/fsm_map.cc
+@@ -42,6 +42,265 @@ static bool pattern_is_subset(const RTLIL::Const &super_pattern, const RTLIL::Co
+ 	return true;
+ }
+ 
++static void mds_4_4(RTLIL::Module *module, RTLIL::SigSpec in_signals, RTLIL::SigSpec out_signals)
++{
++	RTLIL::Const signal_size = RTLIL::Const(8);
++	int signal_width = 8;
++
++	RTLIL::IdString id = NEW_ID;
++	RTLIL::Wire *xor_wire_0 = module->addWire(NEW_ID, signal_width);
++	RTLIL::Cell *xor_cell_0 = module->addCell(id, ID($xor));
++	xor_cell_0->setPort(ID::A, in_signals.extract(0, 8));
++	xor_cell_0->setPort(ID::B, in_signals.extract(8, 8));
++	xor_cell_0->setPort(ID::Y, RTLIL::SigSpec(xor_wire_0));
++	xor_cell_0->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++	xor_cell_0->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++	xor_cell_0->parameters[ID::A_WIDTH] = signal_size;
++	xor_cell_0->parameters[ID::B_WIDTH] = signal_size;
++	xor_cell_0->parameters[ID::Y_WIDTH] = signal_size;
++
++	id = NEW_ID;
++	RTLIL::Wire *xor_wire_1 = module->addWire(NEW_ID, signal_width);
++	RTLIL::Cell *xor_cell_1 = module->addCell(id, ID($xor));
++	xor_cell_1->setPort(ID::A, in_signals.extract(16, 8));
++	xor_cell_1->setPort(ID::B, in_signals.extract(24, 8));
++	xor_cell_1->setPort(ID::Y, RTLIL::SigSpec(xor_wire_1));
++	xor_cell_1->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++	xor_cell_1->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++	xor_cell_1->parameters[ID::A_WIDTH] = signal_size;
++	xor_cell_1->parameters[ID::B_WIDTH] = signal_size;
++	xor_cell_1->parameters[ID::Y_WIDTH] = signal_size;
++
++	id = NEW_ID;
++	RTLIL::Wire *xor_wire_2 = module->addWire(NEW_ID, signal_width);
++	RTLIL::Cell *xor_cell_2 = module->addCell(id, ID($xor));
++	xor_cell_2->setPort(ID::A, in_signals.extract(8, 8));
++	xor_cell_2->setPort(ID::B, RTLIL::SigSpec(xor_wire_1));
++	xor_cell_2->setPort(ID::Y, RTLIL::SigSpec(xor_wire_2));
++	xor_cell_2->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++	xor_cell_2->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++	xor_cell_2->parameters[ID::A_WIDTH] = signal_size;
++	xor_cell_2->parameters[ID::B_WIDTH] = signal_size;
++	xor_cell_2->parameters[ID::Y_WIDTH] = signal_size;
++
++	id = NEW_ID;
++	RTLIL::Wire *alpha_wire_0 = module->addWire(NEW_ID, signal_width);
++	RTLIL::Cell *xor_cell_alpha0 = module->addCell(id, ID($xor));
++	RTLIL::SigSpec shifted_signal_alpha0 = {RTLIL::SigSpec(xor_wire_0)[6], RTLIL::SigSpec(xor_wire_0)[5], RTLIL::SigSpec(xor_wire_0)[4], RTLIL::SigSpec(xor_wire_0)[3], RTLIL::SigSpec(xor_wire_0)[2], RTLIL::SigSpec(xor_wire_0)[1], RTLIL::SigSpec(xor_wire_0)[0], RTLIL::SigSpec(xor_wire_0)[7]};
++	xor_cell_alpha0->setPort(ID::A, RTLIL::SigSpec(xor_wire_0)[1]);
++	xor_cell_alpha0->setPort(ID::B, shifted_signal_alpha0);
++	xor_cell_alpha0->setPort(ID::Y, alpha_wire_0);
++	xor_cell_alpha0->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++	xor_cell_alpha0->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++	xor_cell_alpha0->parameters[ID::A_WIDTH] = RTLIL::Const(1);
++	xor_cell_alpha0->parameters[ID::B_WIDTH] = signal_size;
++	xor_cell_alpha0->parameters[ID::Y_WIDTH] = signal_size;
++
++	id = NEW_ID;
++	RTLIL::Wire *xor_wire_3 = module->addWire(NEW_ID, signal_width);
++	RTLIL::Cell *xor_cell_3 = module->addCell(id, ID($xor));
++	xor_cell_3->setPort(ID::A, in_signals.extract(24, 8));
++	xor_cell_3->setPort(ID::B, RTLIL::SigSpec(alpha_wire_0));
++	xor_cell_3->setPort(ID::Y, RTLIL::SigSpec(xor_wire_3));
++	xor_cell_3->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++	xor_cell_3->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++	xor_cell_3->parameters[ID::A_WIDTH] = signal_size;
++	xor_cell_3->parameters[ID::B_WIDTH] = signal_size;
++	xor_cell_3->parameters[ID::Y_WIDTH] = signal_size;
++
++	id = NEW_ID;
++	RTLIL::Wire *alpha_wire_1 = module->addWire(NEW_ID, signal_width);
++	RTLIL::Cell *xor_cell_alpha1 = module->addCell(id, ID($xor));
++	RTLIL::SigSpec shifted_signal_alpha1 = {RTLIL::SigSpec(xor_wire_3)[6], RTLIL::SigSpec(xor_wire_3)[5], RTLIL::SigSpec(xor_wire_3)[4], RTLIL::SigSpec(xor_wire_3)[3], RTLIL::SigSpec(xor_wire_3)[2], RTLIL::SigSpec(xor_wire_3)[1], RTLIL::SigSpec(xor_wire_3)[0], RTLIL::SigSpec(xor_wire_3)[7]};
++	xor_cell_alpha1->setPort(ID::A, RTLIL::SigSpec(xor_wire_3)[1]);
++	xor_cell_alpha1->setPort(ID::B, shifted_signal_alpha1);
++	xor_cell_alpha1->setPort(ID::Y, alpha_wire_1);
++	xor_cell_alpha1->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++	xor_cell_alpha1->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++	xor_cell_alpha1->parameters[ID::A_WIDTH] = RTLIL::Const(1);
++	xor_cell_alpha1->parameters[ID::B_WIDTH] = signal_size;
++	xor_cell_alpha1->parameters[ID::Y_WIDTH] = signal_size;
++
++	id = NEW_ID;
++	RTLIL::Cell *xor_cell_4 = module->addCell(id, ID($xor));
++	xor_cell_4->setPort(ID::A, RTLIL::SigSpec(xor_wire_1));
++	xor_cell_4->setPort(ID::B, RTLIL::SigSpec(alpha_wire_1));
++	xor_cell_4->setPort(ID::Y, out_signals.extract(24, 8));
++	xor_cell_4->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++	xor_cell_4->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++	xor_cell_4->parameters[ID::A_WIDTH] = signal_size;
++	xor_cell_4->parameters[ID::B_WIDTH] = signal_size;
++	xor_cell_4->parameters[ID::Y_WIDTH] = signal_size;
++
++	id = NEW_ID;
++	RTLIL::Wire *alpha_wire_2 = module->addWire(NEW_ID, signal_width);
++	RTLIL::Cell *xor_cell_alpha2 = module->addCell(id, ID($xor));
++	RTLIL::SigSpec shifted_signal_alpha2 = {RTLIL::SigSpec(xor_wire_2)[6], RTLIL::SigSpec(xor_wire_2)[5], RTLIL::SigSpec(xor_wire_2)[4], RTLIL::SigSpec(xor_wire_2)[3], RTLIL::SigSpec(xor_wire_2)[2], RTLIL::SigSpec(xor_wire_2)[1], RTLIL::SigSpec(xor_wire_2)[0], RTLIL::SigSpec(xor_wire_2)[7]};
++	xor_cell_alpha2->setPort(ID::A, RTLIL::SigSpec(xor_wire_2)[1]);
++	xor_cell_alpha2->setPort(ID::B, shifted_signal_alpha2);
++	xor_cell_alpha2->setPort(ID::Y, alpha_wire_2);
++	xor_cell_alpha2->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++	xor_cell_alpha2->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++	xor_cell_alpha2->parameters[ID::A_WIDTH] = RTLIL::Const(1);
++	xor_cell_alpha2->parameters[ID::B_WIDTH] = signal_size;
++	xor_cell_alpha2->parameters[ID::Y_WIDTH] = signal_size;
++
++	id = NEW_ID;
++	RTLIL::Cell *xor_cell_5 = module->addCell(id, ID($xor));
++	xor_cell_5->setPort(ID::A, RTLIL::SigSpec(xor_wire_0));
++	xor_cell_5->setPort(ID::B, RTLIL::SigSpec(alpha_wire_2));
++	xor_cell_5->setPort(ID::Y, out_signals.extract(8, 8));
++	xor_cell_5->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++	xor_cell_5->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++	xor_cell_5->parameters[ID::A_WIDTH] = signal_size;
++	xor_cell_5->parameters[ID::B_WIDTH] = signal_size;
++	xor_cell_5->parameters[ID::Y_WIDTH] = signal_size;
++
++	id = NEW_ID;
++	RTLIL::Cell *xor_cell_6 = module->addCell(id, ID($xor));
++	xor_cell_6->setPort(ID::A, RTLIL::SigSpec(xor_wire_3));
++	xor_cell_6->setPort(ID::B, out_signals.extract(8, 8));
++	xor_cell_6->setPort(ID::Y, out_signals.extract(0, 8));
++	xor_cell_6->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++	xor_cell_6->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++	xor_cell_6->parameters[ID::A_WIDTH] = signal_size;
++	xor_cell_6->parameters[ID::B_WIDTH] = signal_size;
++	xor_cell_6->parameters[ID::Y_WIDTH] = signal_size;
++
++	id = NEW_ID;
++	RTLIL::Cell *xor_cell_7 = module->addCell(id, ID($xor));
++	xor_cell_7->setPort(ID::A, RTLIL::SigSpec(alpha_wire_2));
++	xor_cell_7->setPort(ID::B, out_signals.extract(24, 8));
++	xor_cell_7->setPort(ID::Y, out_signals.extract(16, 8));
++	xor_cell_7->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++	xor_cell_7->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++	xor_cell_7->parameters[ID::A_WIDTH] = signal_size;
++	xor_cell_7->parameters[ID::B_WIDTH] = signal_size;
++	xor_cell_7->parameters[ID::Y_WIDTH] = signal_size;
++}
++
++static void mds_wrapper(RTLIL::Module *module, RTLIL::SigSpec ctrl_in_mds, RTLIL::SigSpec modifier_mds, RTLIL::SigSpec state_mds, FsmData fsm_data, RTLIL::SigSpec mds_out)
++{
++	int state_chunk_size = ceil(fsm_data.state_bits / (double)fsm_data.fsm_protect_k);
++	int ctrl_in_chunk_size = ceil(ctrl_in_mds.size() / (double)fsm_data.fsm_protect_k);
++	int modifier_mds_chunk_size= ceil(fsm_data.fsm_protect_mod_size / (double)fsm_data.fsm_protect_k);
++
++	for(int mds_count = 0; mds_count < fsm_data.fsm_protect_k; mds_count ++)
++	{
++		RTLIL::SigSpec in_signals;
++	 	in_signals.append(state_mds.extract(mds_count*state_chunk_size, state_chunk_size));
++	 	in_signals.append(ctrl_in_mds.extract(mds_count*ctrl_in_chunk_size, ctrl_in_chunk_size));
++	    in_signals.append(modifier_mds.extract(mds_count*modifier_mds_chunk_size, modifier_mds_chunk_size));
++	 	mds_4_4(module, in_signals, mds_out.extract(mds_count*32, 32));
++	}
++}
++
++static void mds_input_logic(RTLIL::Module *module, FsmData fsm_data, RTLIL::Wire *state_onehot, RTLIL::SigSpec &ctrl_in, RTLIL::SigSpec ctrl_in_mux, RTLIL::Wire *ctrl_in_mds, RTLIL::SigSpec modifier_mux,  RTLIL::Wire *modifier_mds)
++{
++	// State transition onehot generation
++	// using input control signal pattern & current state
++	RTLIL::Wire *state_transition_onehot = module->addWire(NEW_ID, fsm_data.transition_table.size());
++
++	std::map<RTLIL::Const, int> transitions;
++	for (auto &tr : fsm_data.transition_table)
++		transitions[tr.ctrl_in] = tr.state_in;
++
++	for (int i = 0; i < GetSize(fsm_data.transition_table); i++)
++	{
++		auto &tr = fsm_data.transition_table[i];
++		RTLIL::Const pattern = tr.ctrl_in;
++		RTLIL::SigSpec eq_sig_a, eq_sig_b;
++
++		for (size_t j = 0; j < pattern.bits.size(); j++)
++			if (pattern.bits[j] == RTLIL::State::S0 || pattern.bits[j] == RTLIL::State::S1) {
++				eq_sig_a.append(ctrl_in.extract(j, 1));
++				eq_sig_b.append(RTLIL::SigSpec(pattern.bits[j]));
++			}
++		RTLIL::SigSpec eq_sig_pattern;
++		RTLIL::SigSpec and_sig_pattern;
++
++		if (eq_sig_a.size() > 0)
++		{
++			RTLIL::Wire *eq_wire = module->addWire(NEW_ID);
++			eq_sig_pattern.append(RTLIL::SigSpec(eq_wire));
++			RTLIL::Cell *eq_cell = module->addCell(NEW_ID, ID($eq));
++			eq_cell->setPort(ID::A, eq_sig_a);
++			eq_cell->setPort(ID::B, eq_sig_b);
++			eq_cell->setPort(ID::Y, RTLIL::SigSpec(eq_wire));
++			eq_cell->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++			eq_cell->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++			eq_cell->parameters[ID::A_WIDTH] = RTLIL::Const(eq_sig_a.size());
++			eq_cell->parameters[ID::B_WIDTH] = RTLIL::Const(eq_sig_b.size());
++			eq_cell->parameters[ID::Y_WIDTH] = RTLIL::Const(1);
++
++			RTLIL::Wire *and_wire = module->addWire(NEW_ID);
++			and_sig_pattern.append(RTLIL::SigSpec(and_wire));
++
++			RTLIL::Cell *and_cell = module->addCell(NEW_ID, ID($and));
++			and_cell->setPort(ID::A, RTLIL::SigSpec(state_onehot, tr.state_in));
++			and_cell->setPort(ID::B, eq_sig_pattern);
++			and_cell->setPort(ID::Y, RTLIL::SigSpec(and_wire));
++			and_cell->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++			and_cell->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++			and_cell->parameters[ID::A_WIDTH] = RTLIL::Const(1);
++			and_cell->parameters[ID::B_WIDTH] = RTLIL::Const(1);
++			and_cell->parameters[ID::Y_WIDTH] = RTLIL::Const(1);
++
++			module->connect(RTLIL::SigSig(RTLIL::SigSpec(state_transition_onehot, i), and_sig_pattern));
++		}
++		else
++		{
++			module->connect(RTLIL::SigSig(RTLIL::SigSpec(state_transition_onehot, i), State::S0));
++		}
++
++	}
++	// Set state input for MDS.
++	RTLIL::SigSpec sig_a_state(RTLIL::State::S0, modifier_mds->width);
++	RTLIL::SigSpec sig_s(state_transition_onehot);
++
++	RTLIL::Cell *mux_cell_state = module->addCell(NEW_ID, ID($pmux));
++
++	mux_cell_state->setPort(ID::A, sig_a_state);
++	mux_cell_state->setPort(ID::B, modifier_mux);
++	mux_cell_state->setPort(ID::S, sig_s);
++	mux_cell_state->setPort(ID::Y, RTLIL::SigSpec(modifier_mds));
++	mux_cell_state->parameters[ID::WIDTH] = RTLIL::Const(sig_a_state.size());
++	mux_cell_state->parameters[ID::S_WIDTH] = RTLIL::Const(sig_s.size());
++
++	// Set ctrl input for MDS.
++	RTLIL::SigSpec sig_a_ctrl(RTLIL::State::S0, ctrl_in_mds->width);
++
++	RTLIL::Cell *mux_cell_ctrl = module->addCell(NEW_ID, ID($pmux));
++	
++	mux_cell_ctrl->setPort(ID::A, sig_a_ctrl);
++	mux_cell_ctrl->setPort(ID::B, ctrl_in_mux);
++	mux_cell_ctrl->setPort(ID::S, sig_s);
++	mux_cell_ctrl->setPort(ID::Y, RTLIL::SigSpec(ctrl_in_mds));
++	mux_cell_ctrl->parameters[ID::WIDTH] = RTLIL::Const(sig_a_ctrl.size());
++	mux_cell_ctrl->parameters[ID::S_WIDTH] = RTLIL::Const(sig_s.size());
++}
++
++static void mds_output_logic(RTLIL::Module *module, RTLIL::SigSpec mds_out, RTLIL::SigSpec output, FsmData fsm_data)
++{
++	int state_chunk_size = ceil(fsm_data.state_bits / (double)fsm_data.fsm_protect_k);
++	RTLIL::SigSpec state_out_signal;
++	RTLIL::SigSpec err_out_signal;	
++	for(int mds_count = 0; mds_count < fsm_data.fsm_protect_k; mds_count ++)
++	{
++		state_out_signal.append(mds_out.extract(32*mds_count, state_chunk_size));
++		err_out_signal.append(mds_out.extract(mds_count*32+(32-(fsm_data.fsm_protect_hd*3)), fsm_data.fsm_protect_hd*3));
++	}
++	RTLIL::Cell *xor_err_out = module->addCell(NEW_ID, ID($xor));
++	xor_err_out->setPort(ID::A, state_out_signal);
++	xor_err_out->setPort(ID::B, err_out_signal);
++	xor_err_out->setPort(ID::Y, RTLIL::SigSpec(output));
++	xor_err_out->parameters[ID::A_SIGNED] = RTLIL::Const(false);
++	xor_err_out->parameters[ID::B_SIGNED] = RTLIL::Const(false);
++	xor_err_out->parameters[ID::A_WIDTH] = RTLIL::Const(state_out_signal.size());
++	xor_err_out->parameters[ID::B_WIDTH] = RTLIL::Const(err_out_signal.size());
++	xor_err_out->parameters[ID::Y_WIDTH] = RTLIL::Const(output.size());
++}
++
+ static void implement_pattern_cache(RTLIL::Module *module, std::map<RTLIL::Const, std::set<int>> &pattern_cache, std::set<int> &fullstate_cache, int num_states, RTLIL::Wire *state_onehot, RTLIL::SigSpec &ctrl_in, RTLIL::SigSpec output)
+ {
+ 	RTLIL::SigSpec cases_vector;
+@@ -73,7 +332,6 @@ static void implement_pattern_cache(RTLIL::Module *module, std::map<RTLIL::Const
+ 		{
+ 			RTLIL::Wire *eq_wire = module->addWire(NEW_ID);
+ 			and_sig.append(RTLIL::SigSpec(eq_wire));
+-
+ 			RTLIL::Cell *eq_cell = module->addCell(NEW_ID, ID($eq));
+ 			eq_cell->setPort(ID::A, eq_sig_a);
+ 			eq_cell->setPort(ID::B, eq_sig_b);
+@@ -211,7 +469,6 @@ static void map_fsm(RTLIL::Cell *fsm_cell, RTLIL::Module *module)
+ 		else
+ 		{
+ 			encoding_is_onehot = false;
+-
+ 			RTLIL::Cell *eq_cell = module->addCell(NEW_ID, ID($eq));
+ 			eq_cell->setPort(ID::A, sig_a);
+ 			eq_cell->setPort(ID::B, sig_b);
+@@ -229,74 +486,129 @@ static void map_fsm(RTLIL::Cell *fsm_cell, RTLIL::Module *module)
+ 
+ 	// generate next_state signal
+ 
+-	if (GetSize(fsm_data.state_table) == 1)
+-	{
+-		module->connect(next_state_wire, fsm_data.state_table.front());
+-	}
+-	else
+-	{
+-		RTLIL::Wire *next_state_onehot = module->addWire(NEW_ID, fsm_data.state_table.size());
+-
+-		for (size_t i = 0; i < fsm_data.state_table.size(); i++)
++	if(fsm_data.fsm_protect)
++	{	
++		log("in protect:\n");
++		RTLIL::SigSpec modifier_mux;
++		RTLIL::SigSpec ctrl_in_mux;
++		log("k=%d\n", fsm_data.fsm_protect_k);
++		// Set modifier mux signal.
++		for(int i = 0; i < GetSize(fsm_data.modifier_table); i++)
+ 		{
+-			std::map<RTLIL::Const, std::set<int>> pattern_cache;
+-			std::set<int> fullstate_cache;
++			RTLIL::SigSpec modifier(fsm_data.modifier_table[i].mod, fsm_data.fsm_protect_mod_size);
++			modifier_mux.append(modifier);
++		}
+ 
+-			for (size_t j = 0; j < fsm_data.state_table.size(); j++)
+-				fullstate_cache.insert(j);
++		// Set ctrl in signal.
++		int max_ctrl_signal = 0;
++		std::vector<RTLIL::SigSpec> ctrl_in_tmp;
++		for (int i = 0; i < GetSize(fsm_data.transition_table); i++)
++		{	
++			FsmData::transition_t &tr = fsm_data.transition_table[i];
++			RTLIL::SigSpec ctrl_in_transition;
++			
++			for (size_t j = 0; j < tr.ctrl_in.bits.size(); j++)
++				if (tr.ctrl_in.bits[j] == RTLIL::State::S0 || tr.ctrl_in.bits[j] == RTLIL::State::S1) {
++					ctrl_in_transition.append(ctrl_in.extract(j, 1));
++				}
++			if (ctrl_in_transition.size() > max_ctrl_signal)
++				max_ctrl_signal = ctrl_in_transition.size();
++			ctrl_in_tmp.push_back(ctrl_in_transition);
++		}
++		// Round up.
++		while((max_ctrl_signal % fsm_data.fsm_protect_k) != 0)
++			max_ctrl_signal++;
+ 
+-			for (auto &tr : fsm_data.transition_table) {
+-				if (tr.state_out == int(i))
+-					pattern_cache[tr.ctrl_in].insert(tr.state_in);
+-				else
+-					fullstate_cache.erase(tr.state_in);
++		// Pad ctrl signal to max_ctrl_signal size and store into fsm_data.ctrl_in_mux.
++		for(int i = 0; i < GetSize(ctrl_in_tmp); i++) 
++		{
++			while(ctrl_in_tmp[i].size() < max_ctrl_signal)
++			{
++				ctrl_in_tmp[i].append(State::S0);
+ 			}
+-
+-			implement_pattern_cache(module, pattern_cache, fullstate_cache, fsm_data.state_table.size(), state_onehot, ctrl_in, RTLIL::SigSpec(next_state_onehot, i));
++			ctrl_in_mux.append(ctrl_in_tmp[i]);
+ 		}
+ 
+-		if (encoding_is_onehot)
++		// Check if something went wrong.
++		//int size = modifier_mux.size() + ctrl_in_mux.size() + (fsm_data.state_bits * GetSize(fsm_data.transition_table));
++
++		RTLIL::Wire *modifier_mds= module->addWire(NEW_ID, fsm_data.fsm_protect_mod_size);
++		RTLIL::Wire *ctrl_in_mds = module->addWire(NEW_ID, max_ctrl_signal);
++		RTLIL::Wire *mds_out = module->addWire(NEW_ID, 32*fsm_data.fsm_protect_k);
++		mds_input_logic(module, fsm_data, state_onehot, ctrl_in, ctrl_in_mux, ctrl_in_mds, modifier_mux, modifier_mds);
++		mds_wrapper(module, ctrl_in_mds, modifier_mds, RTLIL::SigSpec(state_wire), fsm_data, RTLIL::SigSpec(mds_out));
++		mds_output_logic(module, RTLIL::SigSpec(mds_out), RTLIL::SigSpec(next_state_wire), fsm_data);
++	}
++	else
++	{
++		if (GetSize(fsm_data.state_table) == 1)
+ 		{
+-			RTLIL::SigSpec next_state_sig(RTLIL::State::Sm, next_state_wire->width);
+-			for (size_t i = 0; i < fsm_data.state_table.size(); i++) {
+-				RTLIL::Const state = fsm_data.state_table[i];
+-				int bit_idx = -1;
+-				for (size_t j = 0; j < state.bits.size(); j++)
+-					if (state.bits[j] == RTLIL::State::S1)
+-						bit_idx = j;
+-				if (bit_idx >= 0)
+-					next_state_sig.replace(bit_idx, RTLIL::SigSpec(next_state_onehot, i));
+-			}
+-			log_assert(!next_state_sig.has_marked_bits());
+-			module->connect(RTLIL::SigSig(next_state_wire, next_state_sig));
++			module->connect(next_state_wire, fsm_data.state_table.front());
+ 		}
+ 		else
+ 		{
+-			RTLIL::SigSpec sig_a(RTLIL::State::Sx, next_state_wire->width);
+-			RTLIL::SigSpec sig_b, sig_s;
+-
+-			for (size_t i = 0; i < fsm_data.state_table.size(); i++) {
+-				RTLIL::Const state = fsm_data.state_table[i];
+-				if (int(i) == fsm_data.reset_state) {
+-					sig_a = RTLIL::SigSpec(state);
+-				} else {
+-					sig_b.append(RTLIL::SigSpec(state));
+-					sig_s.append(RTLIL::SigSpec(next_state_onehot, i));
++			RTLIL::Wire *next_state_onehot = module->addWire(NEW_ID, fsm_data.state_table.size());
++
++			for (size_t i = 0; i < fsm_data.state_table.size(); i++)
++			{
++				std::map<RTLIL::Const, std::set<int>> pattern_cache;
++				std::set<int> fullstate_cache;
++
++				for (size_t j = 0; j < fsm_data.state_table.size(); j++)
++					fullstate_cache.insert(j);
++
++				for (auto &tr : fsm_data.transition_table) {
++					if (tr.state_out == int(i))
++						pattern_cache[tr.ctrl_in].insert(tr.state_in);
++					else
++						fullstate_cache.erase(tr.state_in);
+ 				}
++
++				implement_pattern_cache(module, pattern_cache, fullstate_cache, fsm_data.state_table.size(), state_onehot, ctrl_in, RTLIL::SigSpec(next_state_onehot, i));
+ 			}
+ 
+-			RTLIL::Cell *mux_cell = module->addCell(NEW_ID, ID($pmux));
+-			mux_cell->setPort(ID::A, sig_a);
+-			mux_cell->setPort(ID::B, sig_b);
+-			mux_cell->setPort(ID::S, sig_s);
+-			mux_cell->setPort(ID::Y, RTLIL::SigSpec(next_state_wire));
+-			mux_cell->parameters[ID::WIDTH] = RTLIL::Const(sig_a.size());
+-			mux_cell->parameters[ID::S_WIDTH] = RTLIL::Const(sig_s.size());
++			if (encoding_is_onehot)
++			{
++				RTLIL::SigSpec next_state_sig(RTLIL::State::Sm, next_state_wire->width);
++				for (size_t i = 0; i < fsm_data.state_table.size(); i++) {
++					RTLIL::Const state = fsm_data.state_table[i];
++					int bit_idx = -1;
++					for (size_t j = 0; j < state.bits.size(); j++)
++						if (state.bits[j] == RTLIL::State::S1)
++							bit_idx = j;
++					if (bit_idx >= 0)
++						next_state_sig.replace(bit_idx, RTLIL::SigSpec(next_state_onehot, i));
++				}
++				log_assert(!next_state_sig.has_marked_bits());
++				module->connect(RTLIL::SigSig(next_state_wire, next_state_sig));
++			}
++			else
++			{
++				RTLIL::SigSpec sig_a(RTLIL::State::Sx, next_state_wire->width);
++				RTLIL::SigSpec sig_b, sig_s;
++
++				for (size_t i = 0; i < fsm_data.state_table.size(); i++) {
++					RTLIL::Const state = fsm_data.state_table[i];
++					if (int(i) == fsm_data.reset_state) {
++						sig_a = RTLIL::SigSpec(state);
++					} else {
++						sig_b.append(RTLIL::SigSpec(state));
++						sig_s.append(RTLIL::SigSpec(next_state_onehot, i));
++					}
++				}
++				RTLIL::Cell *mux_cell = module->addCell(NEW_ID, ID($pmux));
++				
++				mux_cell->setPort(ID::A, sig_a);
++				mux_cell->setPort(ID::B, sig_b);
++				mux_cell->setPort(ID::S, sig_s);
++				mux_cell->setPort(ID::Y, RTLIL::SigSpec(next_state_wire));
++				mux_cell->parameters[ID::WIDTH] = RTLIL::Const(sig_a.size());
++				mux_cell->parameters[ID::S_WIDTH] = RTLIL::Const(sig_s.size());
++			}
+ 		}
+ 	}
+ 
+ 	// Generate ctrl_out signal
+-
+ 	for (int i = 0; i < fsm_data.num_outputs; i++)
+ 	{
+ 		std::map<RTLIL::Const, std::set<int>> pattern_cache;
+diff --git a/passes/fsm/fsm_protect.cc b/passes/fsm/fsm_protect.cc
+new file mode 100644
+index 000000000..f8a54b178
+--- /dev/null
++++ b/passes/fsm/fsm_protect.cc
+@@ -0,0 +1,330 @@
++/*
++ *  yosys -- Yosys Open SYnthesis Suite
++ *
++ *  Copyright (C) 2012  Claire Xenia Wolf <claire@yosyshq.com>
++ *  Copyright (C) 2012  Martin Schmölzer <martin@schmoelzer.at>
++ *
++ *  Permission to use, copy, modify, and/or distribute this software for any
++ *  purpose with or without fee is hereby granted, provided that the above
++ *  copyright notice and this permission notice appear in all copies.
++ *
++ *  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ *  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ *  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ *  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ *  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ *  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ *
++ */
++
++#include "kernel/log.h"
++#include "kernel/register.h"
++#include "kernel/sigtools.h"
++#include "kernel/consteval.h"
++#include "kernel/celltypes.h"
++#include "fsmdata.h"
++#include <string>
++#include <iostream>
++#include <fstream>
++
++USING_YOSYS_NAMESPACE
++PRIVATE_NAMESPACE_BEGIN
++
++#define ROT(x) (((x)<<1) | ((x)>>7))
++#define LIN(x) (ROT((x)) ^ (((x)>>1)&1))
++
++int num_mds = 1;
++int mds_max_mod = 0;
++int enc_state_size = 0;
++int in_ctrl_size = 0;
++
++typedef struct FSMState {
++    RTLIL::Const enc_state;
++    RTLIL::Const plain_state;
++	int state_num;
++} fsm_state;
++
++typedef struct FSMTransition {
++    fsm_state in_state;
++    fsm_state out_state;
++    unsigned int in_ctrl_value;
++	vector<int> mod_size;
++	vector<int> mod;
++	RTLIL::SigSpec in_ctrl;
++} fsm_transition;
++
++static int hammingDistance(unsigned int n1, unsigned int n2)
++{
++    unsigned int x = n1 ^ n2;
++    unsigned int setBits = 0;
++ 
++    while (x > 0) {
++        setBits += x & 1;
++        x >>= 1;
++    }
++ 
++    return setBits;
++}
++
++static uint32_t MDS_4(uint32_t x) 
++{
++    uint8_t a = x, b = x>>8, c = x>>16, d = x>>24;
++    a ^= b;
++    c ^= d;
++    d ^= LIN(a);
++    b ^= c;
++    
++    b = LIN(b);
++    a ^= b;
++    c ^= LIN(d);
++    d ^= a;
++    b ^= c;
++    return ((((((uint32_t)c<<8) | b)<<8) | a)<<8) | d;
++}
++
++static void encode_states(vector<fsm_state> &states, int num_states, int req_hd) 
++{
++    int num_bits_min = req_hd + ceil(log(num_states)/log(2)) - 1;
++	log("num_bits min is %d num_states is %d\n", num_bits_min, num_states);
++    int state_size = 0;
++    unsigned int generated_numbers[num_states];
++    int stop = 0;
++
++    for(int num_bits = num_bits_min; (num_bits <= (num_bits + req_hd)) && !stop; num_bits++)
++    {
++        //Generate num_states random numbers of length 2^num_bits.
++        //When the number of tries exceeds the limit, num_bits++.
++        for(int tries = 0; (tries < 1000000) && !stop; tries++) {
++            int valid_enc = 1;
++            for(int i = 0; i < num_states; i++) {
++                generated_numbers[i] = rand() % (int)pow(2, num_bits);
++            }
++            // Get the Hamming Distance between all entries.
++            for(int i = 0; i < num_states; i++) {
++                for(int j = 0; j < num_states; j++) {
++                    if(i != j) {
++                        int hd = hammingDistance(generated_numbers[i], generated_numbers[j]);
++                        if(hd < req_hd) {
++                            valid_enc = 0;
++                        }
++                    }
++                }
++            }
++            if(valid_enc)
++            {   
++                state_size = num_bits;
++                stop = 1;
++            }
++        }
++    }
++	enc_state_size = state_size;
++    for(int it = 0; it < num_states; it++) {
++        states[it].enc_state = RTLIL::Const(generated_numbers[it], state_size);
++    }
++}
++
++static void determine_mds(vector<fsm_transition> &state_transitions, FsmData *fsm_data, int hd) 
++{
++	if (GetSize(state_transitions))
++	{
++		int size = enc_state_size + in_ctrl_size;
++		int k = ceil(size / 32.0);
++		bool mds_found = false;
++		while(!mds_found)
++		{
++			int state_chunk_size = ceil(enc_state_size / (double)k);
++			int in_ctrl_chunk_size = ceil(in_ctrl_size / (double)k);
++			int state_in_ctrl_size = state_chunk_size + in_ctrl_chunk_size;
++			mds_max_mod = 32 - state_in_ctrl_size;
++
++			int state_mask = pow(2, state_chunk_size) - 1;
++			int ctrl_mask = pow(2, in_ctrl_chunk_size) - 1;
++			int hd_mask = pow(2, hd*3) - 1;
++			log("k is %d\n", k);
++
++			bool state_transition_mds_found = true;
++			for(int state_transition_it = 0; state_transition_it < GetSize(state_transitions); state_transition_it++)
++			{
++				int state_chunk;
++				int state_out_chunk;
++				int in_ctrl_chunk;
++				for(int i = 0; i < k; i++)
++				{
++					state_chunk = (state_transitions[state_transition_it].in_state.enc_state.as_int() >> (i*state_chunk_size)) & state_mask;
++					state_out_chunk = (state_transitions[state_transition_it].out_state.enc_state.as_int() >> (i*state_chunk_size)) & state_mask;
++					in_ctrl_chunk = (state_transitions[state_transition_it].in_ctrl_value >> (i*state_chunk_size)) & ctrl_mask;
++					int state_in = state_in = (in_ctrl_chunk << state_chunk_size) | (state_chunk);
++					bool mds_found = false;
++					for(int mod = 1; mod < pow(2, mds_max_mod); mod++) {
++						unsigned int mds_in = (mod << state_in_ctrl_size) | (state_in);
++						unsigned int mds_out = MDS_4(mds_in);
++						unsigned int error = (mds_out>>(32-(hd*3))) & hd_mask;
++						if(((mds_out & state_mask) == state_out_chunk) && error == 0) {
++							int curr_mod_size = (int)log2(mod)+1;
++							state_transitions[state_transition_it].mod_size.push_back(curr_mod_size);
++							state_transitions[state_transition_it].mod.push_back(mod);
++							mds_found = true;
++							log("transition=%d mds_in=%u mds_out=%u\n", state_transition_it, mds_in, mds_out);
++							break;
++						}
++					}
++					state_transition_mds_found &= mds_found;
++				}
++				if(!state_transition_mds_found)
++					break;
++			}
++			mds_found = state_transition_mds_found;
++			if(mds_found)
++			{
++				num_mds = k;
++				enc_state_size = k*state_chunk_size;
++				in_ctrl_size = k*in_ctrl_chunk_size;
++			}
++			k++;
++		}
++	}
++}
++
++static void fsm_protect(RTLIL::Cell *cell, RTLIL::Module *module, int hd)
++{
++	// Get FSM information.
++	FsmData fsm_data;
++	fsm_data.copy_from_cell(cell);
++	fsm_data.fsm_protect = true;
++	RTLIL::SigSpec ctrl_in = cell->getPort(ID::CTRL_IN);
++
++	// Construct fsm_states and fsm_transitions.
++	std::vector<fsm_state> fsm_states;
++	std::vector<fsm_transition> fsm_transitions;
++
++	int num_states = GetSize(fsm_data.state_table);
++
++	for (int i = 0; i < GetSize(fsm_data.state_table); i++)
++	{
++		fsm_state state;
++		state.plain_state = fsm_data.state_table[i];
++		state.state_num = i;
++		fsm_states.push_back(state);
++	}
++
++	// Encode the FSM states with a Hamming Distance of hd.
++	log("Encoding states\n");
++	encode_states(fsm_states, num_states, hd);
++	log("States encoded\n");
++    in_ctrl_size = 0;
++	for (int i = 0; i < GetSize(fsm_data.transition_table); i++)
++	{	
++		FsmData::transition_t &tr = fsm_data.transition_table[i];
++		RTLIL::SigSpec ctrl_in_transition;
++		
++		for (size_t j = 0; j < tr.ctrl_in.bits.size(); j++)
++			if (tr.ctrl_in.bits[j] == RTLIL::State::S0 || tr.ctrl_in.bits[j] == RTLIL::State::S1) {
++				ctrl_in_transition.append(ctrl_in.extract(j, 1));
++			}
++
++		if (ctrl_in_transition.size() > in_ctrl_size)
++			in_ctrl_size = ctrl_in_transition.size();
++		fsm_transition transition;
++		transition.in_state = fsm_states[tr.state_in];
++		transition.out_state = fsm_states[tr.state_out];
++		transition.in_ctrl_value = tr.ctrl_in.as_bin();
++		transition.in_ctrl = ctrl_in_transition;
++		fsm_transitions.push_back(transition);
++	}
++
++	// Generate the MDS values.
++	determine_mds(fsm_transitions, &fsm_data, hd);
++	fsm_data.fsm_protect_k = num_mds;
++	fsm_data.fsm_protect_mod_size = mds_max_mod*num_mds;
++	fsm_data.fsm_protect_hd = hd;
++
++	// Pad ctrl signal to in_ctrl_size size and store into fsm_data.ctrl_in_mux.
++	for(int i = 0; i < GetSize(fsm_transitions); i++) 
++	{
++		while(fsm_transitions[i].in_ctrl.size() < in_ctrl_size)
++		{
++			fsm_transitions[i].in_ctrl.append(State::S0);
++		}
++	}
++
++	// Store modifier into transition table.
++	if((mds_max_mod*num_mds) >= 64)
++		log_error("MDS mod size currently not supported!\n");
++	for(int i = 0; i < GetSize(fsm_transitions); i++)
++	{
++		uint64_t mod_concat = 0;
++		for (size_t mod_it = 0; mod_it < fsm_transitions[i].mod.size(); ++mod_it)
++		{
++			mod_concat |= fsm_transitions[i].mod[mod_it] << (mod_it*mds_max_mod);
++		}
++		fsm_data.modifier_table[i].mod = mod_concat;
++	}
++	
++	// Set encoded states and set to enc_state_size.
++	fsm_data.state_bits = enc_state_size;
++	for (int i = 0; i < GetSize(fsm_data.state_table); i++)
++	{
++		fsm_data.state_table[i] = RTLIL::Const(fsm_states[i].enc_state.as_int(), fsm_data.state_bits);
++	}
++
++	log("Mapping states to encoded states:");
++    for(int it = 0; it < GetSize(fsm_states); it++) {
++		log(" %d: state %10s -> %10s\n", it, log_signal(fsm_states[it].plain_state, false), log_signal(fsm_states[it].enc_state, false));
++    }
++	log("Maximal input control size: %d\n", in_ctrl_size);
++	log("Encoded state size: %d\n", fsm_data.state_bits);
++	log("Modifier size: %d\n", fsm_data.fsm_protect_mod_size);
++
++	// Write back to FSM cell.
++	fsm_data.copy_to_cell(cell);
++}
++
++struct FsmExportPass : public Pass {
++	FsmExportPass() : Pass("fsm_protect", "protect FSMs against faults") { }
++	void help() override
++	{
++		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
++		log("\n");
++		log("    fsm_export [-noauto] [-o filename] [-origenc] [selection]\n");
++		log("\n");
++		log("This pass creates a KISS2 file for every selected FSM. For FSMs with the\n");
++		log("'fsm_export' attribute set, the attribute value is used as filename, otherwise\n");
++		log("the module and cell name is used as filename. If the parameter '-o' is given,\n");
++		log("the first exported FSM is written to the specified filename. This overwrites\n");
++		log("the setting as specified with the 'fsm_export' attribute. All other FSMs are\n");
++		log("exported to the default name as mentioned above.\n");
++		log("\n");
++		log("    -hd hammingdistance\n");
++		log("        Hamming Distance for the protection\n");
++		log("\n");
++	}
++	void execute(std::vector<std::string> args, RTLIL::Design *design) override
++	{
++		dict<RTLIL::IdString, RTLIL::Const>::iterator attr_it;
++		std::string arg;
++		int hd = 2;
++		size_t argidx;
++
++		log_header(design, "Executing FSM_PROTECT pass (protecting next-state logic against fault attacks).\n");
++
++		for (argidx = 1; argidx < args.size(); argidx++) {
++			arg = args[argidx];
++			if (arg == "-hd") {
++				argidx++;
++				hd = stoi(args[argidx]);
++				continue;
++			}
++			break;
++		}
++		extra_args(args, argidx, design);
++		log("hd=%d\n", hd);
++
++		for (auto mod : design->selected_modules())
++			for (auto cell : mod->selected_cells())
++				if (cell->type == ID($fsm))
++					fsm_protect(cell, mod, hd);
++	}
++} FsmExportPass;
++
++PRIVATE_NAMESPACE_END
+diff --git a/passes/fsm/fsmdata.h b/passes/fsm/fsmdata.h
+index 4ba3b4e4f..e29b4f0ac 100644
+--- a/passes/fsm/fsmdata.h
++++ b/passes/fsm/fsmdata.h
+@@ -28,9 +28,14 @@ struct FsmData
+ {
+ 	int num_inputs, num_outputs, state_bits, reset_state;
+ 	struct transition_t { int state_in, state_out; RTLIL::Const ctrl_in, ctrl_out; };
++	struct modifier_t { int mod_size; uint64_t mod; };
+ 	std::vector<transition_t> transition_table;
++	std::vector<modifier_t> modifier_table;
+ 	std::vector<RTLIL::Const> state_table;
+-
++	bool fsm_protect;
++	int fsm_protect_k;
++	int fsm_protect_mod_size;
++	int fsm_protect_hd;
+ 	void copy_to_cell(RTLIL::Cell *cell)
+ 	{
+ 		cell->parameters[ID::CTRL_IN_WIDTH] = RTLIL::Const(num_inputs);
+@@ -41,6 +46,10 @@ struct FsmData
+ 			state_num_log2++;
+ 		state_num_log2 = max(state_num_log2, 1);
+ 
++		cell->parameters[ID::FSM_PROTECT] = RTLIL::Const(fsm_protect);
++		cell->parameters[ID::FSM_PROTECT_K] = RTLIL::Const(fsm_protect_k);
++		cell->parameters[ID::FSM_PROTECT_MOD_SIZE] = RTLIL::Const(fsm_protect_mod_size);
++		cell->parameters[ID::FSM_PROTECT_HD] = RTLIL::Const(fsm_protect_hd);
+ 		cell->parameters[ID::STATE_BITS] = RTLIL::Const(state_bits);
+ 		cell->parameters[ID::STATE_NUM] = RTLIL::Const(state_table.size());
+ 		cell->parameters[ID::STATE_NUM_LOG2] = RTLIL::Const(state_num_log2);
+@@ -55,10 +64,13 @@ struct FsmData
+ 
+ 		cell->parameters[ID::TRANS_NUM] = RTLIL::Const(transition_table.size());
+ 		cell->parameters[ID::TRANS_TABLE] = RTLIL::Const();
++		cell->parameters[ID::MOD_TABLE] = RTLIL::Const();
+ 		for (int i = 0; i < int(transition_table.size()); i++)
+ 		{
+ 			std::vector<RTLIL::State> &bits_table = cell->parameters[ID::TRANS_TABLE].bits;
++			std::vector<RTLIL::State> &bits_mod_table = cell->parameters[ID::MOD_TABLE].bits;
+ 			transition_t &tr = transition_table[i];
++			modifier_t &mod = modifier_table[i];
+ 
+ 			RTLIL::Const const_state_in = RTLIL::Const(tr.state_in, state_num_log2);
+ 			RTLIL::Const const_state_out = RTLIL::Const(tr.state_out, state_num_log2);
+@@ -73,6 +85,16 @@ struct FsmData
+ 			bits_table.insert(bits_table.end(), bits_state_out.begin(), bits_state_out.end());
+ 			bits_table.insert(bits_table.end(), bits_ctrl_in.begin(), bits_ctrl_in.end());
+ 			bits_table.insert(bits_table.end(), bits_state_in.begin(), bits_state_in.end());
++
++
++			RTLIL::Const const_mod_size = RTLIL::Const(mod.mod_size, 32);
++			RTLIL::Const const_mod = RTLIL::Const(mod.mod, 64);
++			std::vector<RTLIL::State> &bits_mod_size = const_mod_size.bits;
++			std::vector<RTLIL::State> &bits_mod = const_mod.bits;
++
++			bits_mod_table.insert(bits_mod_table.end(), bits_mod_size.begin(), bits_mod_size.end());
++			bits_mod_table.insert(bits_mod_table.end(), bits_mod.begin(), bits_mod.end());
++
+ 		}
+ 	}
+ 
+@@ -81,6 +103,11 @@ struct FsmData
+ 		num_inputs = cell->parameters[ID::CTRL_IN_WIDTH].as_int();
+ 		num_outputs = cell->parameters[ID::CTRL_OUT_WIDTH].as_int();
+ 
++		fsm_protect = cell->parameters[ID::FSM_PROTECT].as_bool();
++		fsm_protect_k = cell->parameters[ID::FSM_PROTECT_K].as_int();
++		fsm_protect_mod_size = cell->parameters[ID::FSM_PROTECT_MOD_SIZE].as_int();
++		fsm_protect_hd = cell->parameters[ID::FSM_PROTECT_HD].as_int();
++
+ 		state_bits = cell->parameters[ID::STATE_BITS].as_int();
+ 		reset_state = cell->parameters[ID::STATE_RST].as_int();
+ 
+@@ -93,6 +120,7 @@ struct FsmData
+ 
+ 		RTLIL::Const state_table = cell->parameters[ID::STATE_TABLE];
+ 		RTLIL::Const trans_table = cell->parameters[ID::TRANS_TABLE];
++		RTLIL::Const mod_table = cell->parameters[ID::MOD_TABLE];
+ 
+ 		for (int i = 0; i < state_num; i++) {
+ 			RTLIL::Const state_code;
+@@ -109,24 +137,37 @@ struct FsmData
+ 			auto off_state_in = off_ctrl_in + num_inputs;
+ 			auto off_end = off_state_in + state_num_log2;
+ 
++			auto off_mod_size = mod_table.bits.begin() + i*(32+64);
++			auto off_mod = off_mod_size + 32;
++			auto off_mod_end = off_mod + 64;
++
+ 			RTLIL::Const state_in, state_out, ctrl_in, ctrl_out;
+ 			ctrl_out.bits.insert(state_in.bits.begin(), off_ctrl_out, off_state_out);
+ 			state_out.bits.insert(state_out.bits.begin(), off_state_out, off_ctrl_in);
+ 			ctrl_in.bits.insert(ctrl_in.bits.begin(), off_ctrl_in, off_state_in);
+ 			state_in.bits.insert(state_in.bits.begin(), off_state_in, off_end);
+ 
++			RTLIL::Const mod_size, mod;
++			mod_size.bits.insert(mod_size.bits.begin(), off_mod_size, off_mod);
++			mod.bits.insert(mod.bits.begin(), off_mod, off_mod_end);
++
+ 			transition_t tr;
+ 			tr.state_in = state_in.as_int();
+ 			tr.state_out = state_out.as_int();
+ 			tr.ctrl_in = ctrl_in;
+ 			tr.ctrl_out = ctrl_out;
+ 
++			modifier_t md;
++			md.mod_size = mod_size.as_int();
++			md.mod = mod.as_uint64();
++
+ 			if (tr.state_in < 0 || tr.state_in >= state_num)
+ 				tr.state_in = -1;
+ 			if (tr.state_out < 0 || tr.state_out >= state_num)
+ 				tr.state_out = -1;
+ 
+ 			transition_table.push_back(tr);
++			modifier_table.push_back(md);
+ 		}
+ 	}
+ 
+@@ -175,4 +216,4 @@ struct FsmData
+ 
+ YOSYS_NAMESPACE_END
+ 
+-#endif
++#endif
+\ No newline at end of file
+diff --git a/techlibs/common/synth.cc b/techlibs/common/synth.cc
+index 79e5933e0..ad2b15325 100644
+--- a/techlibs/common/synth.cc
++++ b/techlibs/common/synth.cc
+@@ -87,8 +87,8 @@ struct SynthPass : public ScriptPass
+ 		log("\n");
+ 	}
+ 
+-	string top_module, fsm_opts, memory_opts, abc;
+-	bool autotop, flatten, noalumacc, nofsm, noabc, noshare, flowmap;
++	string top_module, fsm_opts, memory_opts, abc, fsmprotect_hd;
++	bool autotop, flatten, noalumacc, nofsm, fsmprotect, noabc, noshare, flowmap;
+ 	int lut;
+ 
+ 	void clear_flags() override
+@@ -102,10 +102,12 @@ struct SynthPass : public ScriptPass
+ 		lut = 0;
+ 		noalumacc = false;
+ 		nofsm = false;
++		fsmprotect = false;
+ 		noabc = false;
+ 		noshare = false;
+ 		flowmap = false;
+ 		abc = "abc";
++		fsmprotect_hd ="-hd 2";
+ 	}
+ 
+ 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
+@@ -124,6 +126,10 @@ struct SynthPass : public ScriptPass
+ 				fsm_opts = " -encfile " + args[++argidx];
+ 				continue;
+ 			}
++			if (args[argidx] == "-hd") {
++				fsmprotect_hd = " -hd " + args[++argidx];
++				continue;
++			}
+ 			if (args[argidx] == "-run" && argidx+1 < args.size()) {
+ 				size_t pos = args[argidx+1].find(':');
+ 				if (pos == std::string::npos) {
+@@ -151,6 +157,10 @@ struct SynthPass : public ScriptPass
+ 				nofsm = true;
+ 				continue;
+ 			}
++			if (args[argidx] == "-fsmprotect") {
++				fsmprotect = true;
++				continue;
++			}
+ 			if (args[argidx] == "-noabc") {
+ 				noabc = true;
+ 				continue;
+@@ -222,7 +232,19 @@ struct SynthPass : public ScriptPass
+ 			run("check");
+ 			run("opt -nodffe -nosdff");
+ 			if (!nofsm)
+-				run("fsm" + fsm_opts, "      (unless -nofsm)");
++			{
++				if (!fsmprotect)
++				{
++					run("fsm" + fsm_opts, "      (unless -nofsm)");
++				}
++				else
++				{
++					run("fsm -nomap -norecode");
++					run("fsm_protect " + fsmprotect_hd);
++					run("fsm_map");
++				}
++				
++			}
+ 			run("opt");
+ 			run("wreduce");
+ 			run("peepopt");
